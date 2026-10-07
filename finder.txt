@@ -1,0 +1,387 @@
+--==============================================================
+-- SERVER SCRIPT
+-- Put in: ServerScriptService
+--==============================================================
+
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local MemoryStoreService = game:GetService("MemoryStoreService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local PLACE_ID = game.PlaceId
+
+local CONFIG = {
+	SCAN_LIMIT = 50,
+	SERVER_TTL = 45,
+	PUBLISH_INTERVAL = 15,
+	MAX_RETRIES = 3,
+	MIN_VALUE = 0.01,
+}
+
+--==============================================================
+-- REMOTES
+--==============================================================
+
+local folder = ReplicatedStorage:FindFirstChild("BrainrotFinder")
+
+if not folder then
+	folder = Instance.new("Folder")
+	folder.Name = "BrainrotFinder"
+	folder.Parent = ReplicatedStorage
+end
+
+local function remote(name)
+	local r = folder:FindFirstChild(name)
+
+	if not r then
+		r = Instance.new("RemoteFunction")
+		r.Name = name
+		r.Parent = folder
+	end
+
+	return r
+end
+
+local Scan = remote("Scan")
+local Join = remote("Join")
+local GetIndex = remote("GetIndex")
+
+--==============================================================
+-- BRAINROT INDEX
+--==============================================================
+
+local BrainrotIndex = {
+
+	["Example Common"] = {
+		value = 0.01,
+		rarity = "Common",
+	},
+
+	["Example Rare"] = {
+		value = 1,
+		rarity = "Rare",
+	},
+
+	["Example Mythic"] = {
+		value = 100000000,
+		rarity = "Mythic",
+	},
+
+	["Example Secret"] = {
+		value = 250000000,
+		rarity = "Secret",
+	},
+
+}
+
+--==============================================================
+-- CURRENT SERVER INVENTORY
+--==============================================================
+
+local CurrentBrainrots = {}
+
+local function AddBrainrot(name)
+	local data = BrainrotIndex[name]
+
+	if not data then
+		return false
+	end
+
+	CurrentBrainrots[name] = {
+		name = name,
+		value = data.value,
+		rarity = data.rarity,
+	}
+
+	return true
+end
+
+local function RemoveBrainrot(name)
+	CurrentBrainrots[name] = nil
+end
+
+local function GetHighest()
+	local highest = nil
+
+	for _, brainrot in pairs(CurrentBrainrots) do
+		if not highest or brainrot.value > highest.value then
+			highest = brainrot
+		end
+	end
+
+	return highest
+end
+
+--==============================================================
+-- SERVER SNAPSHOT
+--==============================================================
+
+local function CreateSnapshot()
+
+	local brainrots = {}
+
+	for _, brainrot in pairs(CurrentBrainrots) do
+		table.insert(brainrots, {
+			name = brainrot.name,
+			value = brainrot.value,
+			rarity = brainrot.rarity,
+		})
+	end
+
+	table.sort(brainrots, function(a, b)
+		return a.value > b.value
+	end)
+
+	local highest = brainrots[1]
+
+	return {
+		serverId = game.JobId,
+		placeId = PLACE_ID,
+
+		players = #Players:GetPlayers(),
+		maxPlayers = Players.MaxPlayers,
+
+		timestamp = os.time(),
+
+		brainrots = brainrots,
+
+		highestName = highest and highest.name or nil,
+		highestValue = highest and highest.value or 0,
+	}
+end
+
+--==============================================================
+-- MEMORY STORE
+--==============================================================
+
+local ServerStore =
+	MemoryStoreService:GetSortedMap("BrainrotFinder_V1")
+
+local function PublishServer()
+
+	local snapshot = CreateSnapshot()
+
+	local success, err = pcall(function()
+
+		ServerStore:SetAsync(
+			game.JobId,
+			snapshot,
+			CONFIG.SERVER_TTL,
+			math.floor(snapshot.highestValue)
+		)
+
+	end)
+
+	if not success then
+		warn("[BrainrotFinder]", err)
+	end
+end
+
+--==============================================================
+-- SCANNER
+--==============================================================
+
+local function ScanServers(minValue)
+
+	minValue = tonumber(minValue) or CONFIG.MIN_VALUE
+
+	minValue = math.max(
+		minValue,
+		CONFIG.MIN_VALUE
+	)
+
+	local success, pages = pcall(function()
+
+		return ServerStore:GetRangeAsync(
+			Enum.SortDirection.Descending,
+			CONFIG.SCAN_LIMIT
+		)
+
+	end)
+
+	if not success then
+		warn("[BrainrotFinder] Scan error:", pages)
+		return {}
+	end
+
+	local results = {}
+
+	for _, entry in ipairs(pages) do
+
+		local server = entry.value
+
+		if type(server) == "table" then
+
+			local age =
+				os.time() -
+				(server.timestamp or 0)
+
+			if age <= CONFIG.SERVER_TTL then
+
+				if server.serverId ~= game.JobId then
+
+					if
+						(server.highestValue or 0)
+						>= minValue
+					then
+
+						table.insert(results, server)
+
+					end
+
+				end
+
+			end
+
+		end
+
+	end
+
+	table.sort(results, function(a, b)
+
+		return
+			(a.highestValue or 0)
+			>
+			(b.highestValue or 0)
+
+	end)
+
+	return results
+end
+
+--==============================================================
+-- TELEPORT
+--==============================================================
+
+local function JoinServer(player, serverId)
+
+	if typeof(serverId) ~= "string" then
+		return false, "Invalid server ID"
+	end
+
+	if serverId == "" then
+		return false, "Empty server ID"
+	end
+
+	for attempt = 1, CONFIG.MAX_RETRIES do
+
+		local success, result = pcall(function()
+
+			local options =
+				Instance.new("TeleportOptions")
+
+			options.ServerInstanceId = serverId
+
+			return TeleportService:TeleportAsync(
+				PLACE_ID,
+				{player},
+				options
+			)
+
+		end)
+
+		if success then
+			return true, "Teleport started"
+		end
+
+		warn(
+			"[BrainrotFinder] Teleport attempt",
+			attempt,
+			result
+		)
+
+		task.wait(attempt * 2)
+
+	end
+
+	return false, "Teleport failed"
+end
+
+--==============================================================
+-- TELEPORT FAILURE
+--==============================================================
+
+TeleportService.TeleportInitFailed:Connect(
+	function(player, result, message)
+
+		warn(
+			"[BrainrotFinder] Teleport failed:",
+			player.Name,
+			result.Name,
+			message
+		)
+
+	end
+)
+
+--==============================================================
+-- REMOTE FUNCTIONS
+--==============================================================
+
+Scan.OnServerInvoke = function(player, minimumValue)
+
+	return ScanServers(minimumValue)
+
+end
+
+Join.OnServerInvoke = function(player, serverId)
+
+	return JoinServer(
+		player,
+		serverId
+	)
+
+end
+
+GetIndex.OnServerInvoke = function()
+
+	local result = {}
+
+	for name, data in pairs(BrainrotIndex) do
+
+		table.insert(result, {
+			name = name,
+			value = data.value,
+			rarity = data.rarity,
+		})
+
+	end
+
+	table.sort(result, function(a, b)
+
+		return a.value > b.value
+
+	end)
+
+	return result
+
+end
+
+--==============================================================
+-- SERVER UPDATE LOOP
+--==============================================================
+
+task.spawn(function()
+
+	while true do
+
+		PublishServer()
+
+		task.wait(
+			CONFIG.PUBLISH_INTERVAL
+		)
+
+	end
+
+end)
+
+--==============================================================
+-- TEST DATA
+-- Replace these with your real game events.
+--==============================================================
+
+AddBrainrot("Example Common")
+AddBrainrot("Example Rare")
+AddBrainrot("Example Mythic")
+
+PublishServer()
